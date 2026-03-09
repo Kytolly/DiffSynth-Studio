@@ -136,6 +136,7 @@ def wan_parser():
     
     return parser
 
+# ======== 定义验证回调函数 ========
 def validation_callback(pipe, step, output_dir):
     if args.validation_video is None or args.validation_ref_image is None:
         print("\n[Validation] 警告: 未提供验证视频或参考图路径，跳过验证。\n")
@@ -146,6 +147,9 @@ def validation_callback(pipe, step, output_dir):
     from diffsynth.utils.data import VideoData, save_video
     from PIL import Image
     
+    # 【修复核心 1】深拷贝并备份当前专用于训练的 units 列表
+    training_units = pipe.units.copy() if hasattr(pipe, "units") else None
+    
     try:
         # 临时清理显存，防止训练和推理同时进行导致 OOM
         gc.collect()
@@ -154,12 +158,10 @@ def validation_callback(pipe, step, output_dir):
         # 加载并截取条件视频
         val_video = VideoData(args.validation_video, height=args.height, width=args.width)
         
-        # 【修复点 1】确保帧数满足 Wan 的 N * 4 + 1 规律，避免时间维度报错
         max_frames = args.num_frames if hasattr(args, "num_frames") else len(val_video)
         val_num_frames = min(max_frames, len(val_video))
         val_num_frames = (val_num_frames - 1) // 4 * 4 + 1
         
-        # 截取视频对齐的帧数
         val_video = [val_video[i] for i in range(val_num_frames)]
         
         if args.validation_ref_image.endswith(('.mp4', '.avi', '.mov')):
@@ -173,12 +175,12 @@ def validation_callback(pipe, step, output_dir):
                 prompt=args.validation_prompt,
                 vace_video=val_video, 
                 vace_reference_image=ref_image, 
-                height=args.height,         # <--- 【修复点 2】必须显式传入 height
-                width=args.width,           # <--- 【修复点 3】必须显式传入 width
-                num_frames=val_num_frames,  # <--- 传入对齐后的帧数
-                num_inference_steps=10,
-                seed=1234, 
-                tiled=True # 使用 tiled 降低峰值显存
+                height=args.height,         
+                width=args.width,           
+                num_frames=val_num_frames,  
+                num_inference_steps=10,     
+                seed=1, 
+                tiled=True 
             )
         
         # 保存结果到 checkponits 文件夹下
@@ -186,12 +188,20 @@ def validation_callback(pipe, step, output_dir):
         save_video(video, save_path, fps=15, quality=5)
         print(f"[Validation] 验证生成完成，视频已保存至: {save_path}\n")
         
+    except Exception as e:
+        print(f"[Validation] 验证过程出现异常: {e}\n")
+        
+    finally:
+        if training_units is not None:
+            pipe.units = training_units
+        for unit in pipe.units:
+            if hasattr(unit, "train"):
+                unit.train()
+                
         # 再次清理显存，交还给训练流
         gc.collect()
         torch.cuda.empty_cache()
-        
-    except Exception as e:
-        print(f"[Validation] 验证过程出现异常: {e}\n")
+    # ==================================
     
 
 if __name__ == "__main__":
