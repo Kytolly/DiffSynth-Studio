@@ -44,6 +44,13 @@ class WanTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        print("[Info] 强制对齐模型权重为 BFloat16...")
+        if hasattr(self.pipe, 'vae'):
+            self.pipe.vae.to(torch.bfloat16)
+        if hasattr(self.pipe, 'text_encoder'):
+            self.pipe.text_encoder.to(torch.bfloat16)
+        if hasattr(self.pipe, 'dit'):
+            self.pipe.dit.to(torch.bfloat16)
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -107,7 +114,6 @@ class WanTrainingModule(DiffusionTrainingModule):
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
 
-
 def wan_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser = add_general_config(parser)
@@ -117,8 +123,65 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    
+    # ======== 新增参数 (用于验证和断点恢复) ========
+    parser.add_argument("--resume_step", type=int, default=0, help="恢复训练时的起始步数 (Logger记录用)")
+    parser.add_argument("--validation_steps", type=int, default=None, help="每隔多少步进行一次验证推理并保存")
+    parser.add_argument("--validation_prompt", type=str, default="", help="验证推理时使用的 prompt")
+    parser.add_argument("--validation_video", type=str, default=None, help="验证推理用的第一人称条件视频路径")
+    parser.add_argument("--validation_ref_image", type=str, default=None, help="验证推理用的首帧参考图或原视频路径")
+    # ===============================================
+    
     return parser
 
+def validation_callback(pipe, step, output_dir):
+        if args.validation_video is None or args.validation_ref_image is None:
+            print("\n[Validation] 警告: 未提供验证视频或参考图路径，跳过验证。\n")
+            return
+            
+        print(f"\n[Validation] 正在执行第 {step} 步的验证推理...")
+        import gc
+        from diffsynth.utils.data import VideoData, save_video
+        from PIL import Image
+        
+        try:
+            # 临时清理显存，防止训练和推理同时进行导致 OOM
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # 加载条件视频和参考图
+            val_video = VideoData(args.validation_video, height=args.height, width=args.width)
+            # 截取对应帧数
+            val_video = [val_video[i] for i in range(min(args.num_frames, len(val_video)))]
+            
+            if args.validation_ref_image.endswith(('.mp4', '.avi', '.mov')):
+                ref_image = VideoData(args.validation_ref_image, height=args.height, width=args.width)[0]
+            else:
+                ref_image = Image.open(args.validation_ref_image).convert("RGB").resize((args.width, args.height))
+
+            # 开启 no_grad 进行验证推理
+            with torch.no_grad():
+                video = pipe(
+                    prompt=args.validation_prompt,
+                    vace_video=val_video, 
+                    vace_reference_image=ref_image, 
+                    num_frames=len(val_video),
+                    seed=1, tiled=True # 使用 tiled 降低峰值显存
+                )
+            
+            # 保存结果到 checkponits 文件夹下
+            save_path = os.path.join(output_dir, f"validation_step_{step}.mp4")
+            save_video(video, save_path, fps=15, quality=5)
+            print(f"[Validation] 验证生成完成，视频已保存至: {save_path}\n")
+            
+            # 再次清理显存，交还给训练流
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"[Validation] 验证过程出现异常 (可能由于显存不足): {e}\n")
+    # ==================================
+    
 
 if __name__ == "__main__":
     parser = wan_parser()
@@ -170,10 +233,16 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
-    model_logger = ModelLogger(
+
+    # 实例化更新后的 Logger
+    model_logger = MyModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        resume_step=args.resume_step,  # 传入断点步数
+        validation_func=validation_callback if args.validation_steps else None, # 传入验证函数
+        validation_steps=args.validation_steps # 传入验证频率
     )
+    
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
